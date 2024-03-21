@@ -5,7 +5,7 @@ AutoCancer is an automated multi-modal framework that leverages metaheuristic op
 <img src='Overview of AutoCancer.svg' width=90%>
 
 # Dataset
-The preprocessed NSCLC datasets are in [dataset folder](./dataset/).
+The preprocessed datasets are in [dataset folder](./dataset/).
 
 # Results 
 The experiment results are in [result folder](./result/). 
@@ -32,10 +32,6 @@ $ docker pull linjingliu/autocancer:v0
 3.  Start a container based on the image.
 ```bash
 $ docker run --name autocancer --gpus all -it --rm -v <Replace with your local file path prefix>/AutoCancer:/AutoCancer linjingliu/autocancer:v0 /bin/bash
-$ docker run --name autocancer1 --gpus all -it --rm -v /aaa/fionafyang/buddy1/elainelliu/AutoCancer:/AutoCancer linjingliu/autocancer:v0 /bin/bash
-docker run --name autocancer --gpus all -it --rm -v /aaa/fionafyang/buddy1/elainelliu/AutoCancer:/AutoCancer mirrors.tencent.com/elainelliu/class:v1 /bin/bash
-
-docker run --gpus all -it mirrors.tencent.com/elainelliu/class:v1 /bin/bash
 ```
 
 4. Download datasets and checkpoint from provided links and replace the corresponding folder in scTranslator.
@@ -50,9 +46,9 @@ $ conda activate pyenv
 
 6. Demo for automated deep learning.
 ```bash
-$ python ./code/AutoCancer.py \
---x_1d_train_path='./dataset/x_1d_train.pkl' \
---x_2d_train_path='./dataset/x_2d_train.pkl' \
+$ python ./code/AutoCancer_NSCLC.py \
+--x_1d_train_path='./dataset/NSCLC_cohort/x_1d_train.pkl' \
+--x_2d_train_path='./dataset/NSCLC_cohort/x_2d_train.pkl' \
 --optimized_result_path='./result/optimized-result.pkl'
 ```
 
@@ -60,10 +56,10 @@ $ python ./code/AutoCancer.py \
 ```bash
 # Inferrence with fine-tune
 $ python ./code/early_cancer_detection.py \
---x_1d_train_path='./dataset/x_1d_train.pkl' \
---x_2d_train_path='./dataset/x_2d_train.pkl' \
---x_1d_test_path='./dataset/x_1d_test.pkl' \
---x_2d_test_path='./dataset/x_2d_test.pkl'
+--x_1d_train_path='./dataset/NSCLC_cohort/x_1d_train.pkl' \
+--x_2d_train_path='./dataset/NSCLC_cohort/x_2d_train.pkl' \
+--x_1d_test_path='./dataset/NSCLC_cohort/x_1d_test.pkl' \
+--x_2d_test_path='./dataset/NSCLC_cohort/x_2d_test.pkl'
 ```
 
 8. Demo for obtaining key gene mutation across all patients.

@@ -1,17 +1,14 @@
 from utils import *
 from copy import deepcopy
 from sklearn.model_selection import StratifiedShuffleSplit
-
 import random
 import skopt
 import argparse
 import os
 import numpy as np
 import pandas as pd
-
 import warnings
 warnings.filterwarnings("ignore")
-
 
 def main():
 
@@ -98,7 +95,6 @@ def main():
     #---   Save optimized results    ---#
     for i in ['models', 'space', 'random_state', 'specs']:
         del gp[i]  
-    # print(gp_path)
     skopt.dump(gp, gp_path)
     
 if __name__ == '__main__':

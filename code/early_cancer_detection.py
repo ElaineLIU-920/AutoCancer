@@ -26,13 +26,13 @@ def main():
                         help='parameter for data splitting')
     parser.add_argument('--feature_batch', type=int, default=10,
                         help='the maximum value of a feature group for FS (default: 10)')
-    parser.add_argument('--x_1d_train_path', default='./dataset/x_1d_train.pkl',
+    parser.add_argument('--x_1d_train_path', default='./dataset/NSCLC_cohort/x_1d_train.pkl',
                         help='path for loading the 1D training data including label')
-    parser.add_argument('--x_2d_train_path', default='./dataset/x_2d_train.pkl',
+    parser.add_argument('--x_2d_train_path', default='./dataset/NSCLC_cohort/x_2d_train.pkl',
                         help='path for loading the 2D training data')
-    parser.add_argument('--x_1d_test_path', default='./dataset/x_1d_test.pkl',
+    parser.add_argument('--x_1d_test_path', default='./dataset/NSCLC_cohort/x_1d_test.pkl',
                         help='path for loading the 1D test data including label')
-    parser.add_argument('--x_2d_test_path', default='./dataset/x_2d_test.pkl',
+    parser.add_argument('--x_2d_test_path', default='./dataset/NSCLC_cohort/x_2d_test.pkl',
                         help='path for loading the 2D test data')
     parser.add_argument('--optimized_result_path', default='./result/optimized_result.pkl',
                         help='path for saving the optimized result')

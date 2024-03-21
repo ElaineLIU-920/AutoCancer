@@ -11,7 +11,6 @@ import torch.optim as optim
 
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision.ops import MLP
 
 from skopt.utils import use_named_args
 from skopt import gp_minimize
@@ -28,6 +27,7 @@ from math import ceil
 from copy import deepcopy
 
 import os
+import gc
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 seed = 1105
@@ -77,7 +77,7 @@ def len_feature(x):
     if x is None:
         length = 0
     elif isinstance(x.index, pd.MultiIndex):
-        length = x.index.get_level_values(x.index.names[0]).unique()
+        length = len(x.index.get_level_values(x.index.names[0]).unique())
     else:
         length = len(x)
     return length
@@ -86,7 +86,6 @@ class FeatureSelectionDataset(Dataset):
     def __init__(self, x_1d=None, x_2d=None, y=None, max_len_2d=84):
         super().__init__()
         self.x_1d, self.x_2d, self.y = x_1d, x_2d, y
-        # len_1d, len_2d = len(self.x_1d), len(self.x_2d.index.get_level_values(self.x_2d.index.names[0]).unique())
         len_1d, len_2d = len_feature(self.x_1d), len_feature(self.x_2d)
         self.len, self.max_len_2d = max(len_1d, len_2d), max_len_2d
 
@@ -100,8 +99,11 @@ class FeatureSelectionDataset(Dataset):
             x_2d = TruncatePadding(x_2d, self.max_len_2d)
             return np.array(self.x_1d.loc[k].values.tolist()), x_2d, self.y[k]
         elif (self.x_2d is not None):
-            k = self.x_2d.index[index]
-            x_2d = flatten2array(self.x_2d.loc[k])
+            k = self.y.index[index]
+            if k in self.x_2d.index.get_level_values(self.x_2d.index.names[0]).unique():
+                x_2d = flatten2array(self.x_2d.loc[k])
+            else:
+                x_2d = np.zeros(flatten2array(self.x_2d[:1]).shape)
             x_2d = TruncatePadding(x_2d, self.max_len_2d)
             return [], x_2d, self.y[k]
         elif self.x_1d is not None:
@@ -110,8 +112,6 @@ class FeatureSelectionDataset(Dataset):
         else:
             print('No data provided!')
             return None
-
-
     def __len__(self):
         return self.len
 
@@ -257,7 +257,7 @@ class AdaptiveAttentionModel(nn.Module):
         self.norm = LayerNorm(layer.size)
         self.posi = PositionalEncoding(d_model, dropout)
         self.out = nn.Linear(d_model, 1) 
-        self.attn_matrices = []
+        # self.attn_matrices = []
 
     def forward(self, x):
         "Pass the input (and mask) through each layer in turn."
@@ -265,7 +265,7 @@ class AdaptiveAttentionModel(nn.Module):
         x = self.posi(x)
         for layer in self.layers:
             x = layer(x)
-            self.attn_matrices.append(layer.self_attn.attn)
+            # self.attn_matrices.append(layer.self_attn.attn)
         return self.out(self.norm(x))
 
 class AdaptiveMLP(nn.Module):
@@ -273,6 +273,8 @@ class AdaptiveMLP(nn.Module):
     def __init__(self, num_fc_input, num_output_nodes, num_fc_layers, initial_dropout, act=nn.Sigmoid()):
         super().__init__()
         self.num_fc_layers, self.act = num_fc_layers, act
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
         if num_fc_layers == 1:
             self.fc0 = nn.Linear(num_fc_input, num_output_nodes)
         else:
@@ -297,6 +299,7 @@ class AdaptiveMLP(nn.Module):
                 # the last fc layer
                 exec('self.fc{} = nn.Linear(tmp_output, num_output_nodes)'.format(i+1))
 
+        self.to(self.device)
     def forward(self, x):
         if self.num_fc_layers == 1:
             outputs = self.fc0(x)
@@ -313,8 +316,7 @@ class AdaptiveMLP(nn.Module):
                 # the last fc layer
                 outputs = eval('self.fc{}(outputs)'.format(i+1))
         return outputs.softmax(dim=1)
-
-
+        
 class AutoTransformer(nn.Module):
     """
     Class description: Transformer accepts both 1d features and 2d features
@@ -371,10 +373,117 @@ class AutoTransformer(nn.Module):
         x = torch.squeeze(self.attention_model(x), dim=-1)
         #--- MLP block ---#
         y = self.to_out(x)
+        del x, x_1d, x_2d
+        torch.cuda.empty_cache()
+        gc.collect()
         return y
+
+    def to_device(self, x, device):
+        if x == []:
+            x = None
+        else:
+            x = x.float().to(device)
+        return x
         
     def train_epoch(self, train_iter, optimizer, l, device):
         
+        model = self
+        model.train()
+        train_loss, y_hat_all, y_all = 0, [], []
+        for batch_idx, (x_1d, x_2d, y) in enumerate(train_iter):
+            x_1d, x_2d, y = self.to_device(x_1d, device), self.to_device(x_2d, device), y.to(device)
+            #--- Prediction ---#
+            optimizer.zero_grad()
+            y_hat = model(x_1d, x_2d)
+
+            loss = l(y_hat, y)
+            train_loss += loss.sum()
+            loss.sum().backward()
+            optimizer.step()
+
+            if device == 'cpu':
+                    y_hat_all.extend(y_hat.numpy().tolist())
+                    y_all.extend(y.numpy().tolist())
+            else:
+                y_hat_all.extend(y_hat.detach().cpu().numpy().tolist())
+                y_all.extend(y.detach().cpu().numpy().tolist())
+            del loss, x_1d, x_2d, y, y_hat
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        train_loss /= len(y_all)
+        del model, train_iter, optimizer, l, device
+        torch.cuda.empty_cache()
+        gc.collect()
+        return np.array(y_hat_all), np.array(y_all), train_loss
+    
+    
+    def train_val(self, train_iter, val_iter, test_iter=None):
+        device = self.device
+        patience, num_epochs, lr = self.patience, 100, self.lr
+        early_stopping = EarlyStopping(patience, verbose=False)
+        
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+        #-----  Loss -----#
+        loss = nn.CrossEntropyLoss(reduction="none")
+        loss = loss.to(device)
+
+        for epoch in range(num_epochs):
+            # print('epoch ', epoch)
+            _, _, train_loss = self.train_epoch(train_iter, optimizer, loss, device)
+            y_hat_val, y_true_val, val_loss = self.test(val_iter)
+            if test_iter is not None:
+                y_hat_test, y_true_test, test_loss = self.test(test_iter)
+            else:
+                y_hat_test, y_true_test, test_loss = 0,0,0
+            #--- early stop ---#
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+        del train_iter, val_iter, optimizer, loss, device
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print('Training loss: {:.4f}, val loss: {:f}, test loss: {:f}'.format(train_loss, val_loss, test_loss), flush=True)
+        return y_hat_val, y_true_val, y_hat_test, y_true_test
+    
+    def test(self, test_iter):
+        model, device = self, self.device
+        model.eval()
+        #-----  Loss -----#
+        l = nn.CrossEntropyLoss(reduction="none")
+        l = l.to(device)
+        test_loss, y_hat_all, y_all = 0, [], []
+        with torch.no_grad():
+            for batch_idx, (x_1d, x_2d, y) in enumerate(test_iter):
+                x_1d, x_2d, y = self.to_device(x_1d, device), self.to_device(x_2d, device), y.to(device)
+                #--- Prediction ---#
+                y_hat = model(x_1d, x_2d)
+                loss = l(y_hat, y)
+                test_loss += loss.sum()
+
+                if device == 'cpu':
+                    y_hat_all.extend(y_hat.numpy().tolist())
+                    y_all.extend(y.numpy().tolist())
+                else:
+                    y_hat_all.extend(y_hat.detach().cpu().numpy().tolist())
+                    y_all.extend(y.detach().cpu().numpy().tolist())
+                del loss, x_1d, x_2d, y, y_hat
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+            test_loss /= len(y_all)
+        del model, test_iter, l
+        torch.cuda.empty_cache()
+        gc.collect()
+        return np.array(y_hat_all), np.array(y_all), test_loss
+
+class AutoModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def train_epoch(self, train_iter, optimizer, l, device):
         model = self
         model.train()
         train_loss, y_hat_all, y_all = 0, [], []
@@ -406,7 +515,7 @@ class AutoTransformer(nn.Module):
     
     def train_val(self, train_iter, val_iter, test_iter=None):
         device = self.device
-        patience, num_epochs, lr = self.patience, 1, self.lr
+        patience, num_epochs, lr = self.patience, 100, self.lr
         early_stopping = EarlyStopping(patience, verbose=False)
         
         optimizer = optim.Adam(self.parameters(), lr=lr)
@@ -416,7 +525,7 @@ class AutoTransformer(nn.Module):
 
         for epoch in range(num_epochs):
             torch.cuda.empty_cache()
-            
+            gc.collect()
             y_hat_train, y_true_train, train_loss = self.train_epoch(train_iter, optimizer, loss, device)
             y_hat_val, y_true_val, val_loss = self.test(val_iter)
             if test_iter is not None:
@@ -463,6 +572,57 @@ class AutoTransformer(nn.Module):
             test_loss /= len(y_all)
         return np.array(y_hat_all), np.array(y_all), test_loss
 
+
+class AutoMLP(AutoModel):
+    def __init__(self, params):
+        super().__init__()
+        query = 'num_output_nodes, num_fc_layers, initial_dropout, act'
+        num_output_nodes, num_fc_layers, initial_dropout, act = assign_vars(query, params)
+        num_fc_input = params['len_1d']
+        self.patience, self.lr = params['patience'], params['learning_rate']
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.num_fc_layers, self.act = num_fc_layers, act
+        if num_fc_layers == 1:
+            self.fc0 = nn.Linear(num_fc_input, num_output_nodes)
+        else:
+            # the first fc layer
+            self.fc0 = nn.Linear(num_fc_input, int(ceil(num_fc_input/2)))
+            self.dropout0 = nn.Dropout(1.1*initial_dropout)
+            if num_fc_layers == 2:
+                # the last fc layer when num_fc_layers == 2
+                self.fc1 = nn.Linear(int(ceil(num_fc_input/2)), num_output_nodes)
+            else:
+                # the middle fc layer
+                for i in range(1,num_fc_layers-1):
+                    tmp_input = int(ceil(num_fc_input/2**i))
+                    tmp_output = int(ceil(num_fc_input/2**(i+1)))
+                    exec('self.fc{} = nn.Linear(tmp_input, tmp_output)'.format(i))
+                    if i < ceil(num_fc_layers/2) and 1.1**(i+1)*initial_dropout < 1:
+                        exec('self.dropout{} = nn.Dropout(1.1**(i+1)*initial_dropout)'.format(i))
+                    elif i >= ceil(num_fc_layers/2) and 1.1**(num_fc_layers-1-i)*initial_dropout < 1:
+                        exec('self.dropout{} = nn.Dropout(1.1**(num_fc_layers-1-i)*initial_dropout)'.format(i))
+                    else:
+                        exec('self.dropout{} = nn.Dropout(0.5)'.format(i))
+                # the last fc layer
+                exec('self.fc{} = nn.Linear(tmp_output, num_output_nodes)'.format(i+1))
+        self.to(self.device)
+
+    def forward(self, x, x2=None):
+        if self.num_fc_layers == 1:
+            outputs = self.fc0(x)
+        else:
+            # the first fc layer
+            outputs = self.act(self.dropout0(self.fc0(x)))
+            if self.num_fc_layers == 2:
+                # the last fc layer when num_fc_layers == 2
+                outputs = self.fc1(outputs)
+            else:
+                # the middle fc layer
+                for i in range(1,self.num_fc_layers-1):
+                    outputs = eval('self.act(self.dropout{}(self.fc{}(outputs)))'.format(i,i))
+                # the last fc layer
+                outputs = eval('self.fc{}(outputs)'.format(i+1))
+        return outputs.softmax(dim=1)
 ###############################################
 #---------------   Model tools   -------------#
 ###############################################
@@ -582,7 +742,7 @@ def repeat_evaluate(test_accuracy, test_precision, test_recall, test_f1, test_ro
 ###############################################
 #----------   Bayesian optimization   --------#
 ###############################################
-def fs_dataset(x_1d, x_2d, f_1d, f_2d_0, f_2d_1):
+def fs_dataset(x_1d, x_2d, f_1d=None, f_2d_0=None, f_2d_1=None):
     idx = pd.IndexSlice
     if (f_1d is not None)&(f_2d_0 is not None)&(f_2d_1 is not None):
         return x_1d[f_1d], x_2d.loc[idx[:,f_2d_0],f_2d_1]
@@ -611,8 +771,12 @@ def len_2d_feature(val_loader):
     _,tmp_2d,_ = next(iter(val_loader))
     if tmp_2d==[]:
         len_2d_0, len_2d_1 = 0, 0
-    else:
+    elif tmp_2d.dim() == 3:
+        len_2d_0, len_2d_1 = tmp_2d.shape[1], tmp_2d.shape[2]
+    elif tmp_2d.dim() == 2:
         len_2d_0, len_2d_1 = tmp_2d.shape[0], tmp_2d.shape[1]
+    else:
+        raise ValueError("tmp_2d must have either 2 or 3 dimensions")
     return len_2d_0, len_2d_1
 
 def auto_nnd(hyperparameter_spaces, n_calls, model_class, determin_hyp, x_1d=None, x_2d=None, y=None, 
@@ -643,8 +807,6 @@ batch_size=16, num_outer_split=5, frac_inner_val=0.25, max_len_2d=84, **kwargs):
             ros = RandomOverSampler(sampling_strategy='auto', random_state=seed)
             train_index, _ = ros.fit_resample(train_index.reshape(-1, 1), y.iloc[train_index])
             train_index = train_index.flatten()
-            # val_index, _ = ros.fit_resample(val_index.reshape(-1, 1), y.iloc[val_index])
-            # val_index = val_index.flatten()
             dataset = FeatureSelectionDataset(x_1d_fs, x_2d_fs, y, max_len_2d)
             train_dataset = Subset(dataset, train_index)
             train_loader = DataLoader(train_dataset, batch_size=batch_size)
@@ -652,10 +814,10 @@ batch_size=16, num_outer_split=5, frac_inner_val=0.25, max_len_2d=84, **kwargs):
             val_loader = DataLoader(val_dataset, batch_size=batch_size)
             test_dataset = Subset(dataset, test_index)
             test_loader = DataLoader(test_dataset, batch_size=batch_size)
-            tmp_1d,tmp_2d,_ = next(iter(val_loader))
-            
+            tmp_1d,_,_ = next(iter(val_loader))
+            len_2d_0, len_2d_1 = len_2d_feature(val_loader)
             #--- construct model with optimized hyperparameters ---#
-            model_params.update({'len_1d':tmp_1d.shape[1], 'len_2d':tmp_2d.shape[1], 'dim_2d_input':tmp_2d.shape[2]})
+            model_params.update({'len_1d':tmp_1d.shape[1], 'len_2d':len_2d_0, 'dim_2d_input':len_2d_1})
             model = model_class(model_params)
             model.apply(init_weights)
             y_hat_val, y_true_val, y_hat_test, y_true_test = model.train_val(train_loader, val_loader, test_loader)
@@ -663,7 +825,6 @@ batch_size=16, num_outer_split=5, frac_inner_val=0.25, max_len_2d=84, **kwargs):
             val_accuracy, val_precision, val_recall, val_f1, val_roc_auc, val_pr_auc = repeat_evaluate(val_accuracy, val_precision, val_recall, val_f1, val_roc_auc, val_pr_auc, y_hat_val, y_true_val, 'binary', flag_soft=True)
             test_accuracy, test_precision, test_recall, test_f1, test_roc_auc, test_pr_auc = repeat_evaluate(test_accuracy, test_precision, test_recall, test_f1, test_roc_auc, test_pr_auc, y_hat_test, y_true_test, 'binary', flag_soft=True)
 
-            # loss_all = loss_all + loss
             i = num_outer_split
         print('-'*40)
         print('Overall performance on validation set:')
@@ -675,9 +836,7 @@ batch_size=16, num_outer_split=5, frac_inner_val=0.25, max_len_2d=84, **kwargs):
         print('-'*40)
         
         return -0.25*(val_accuracy+test_accuracy)/num_outer_split-0.25*(val_roc_auc+test_roc_auc)/num_outer_split
-
-            
-
+      
     gp = gp_minimize(objective_function, search_spaces, n_calls=n_calls, random_state=seed, acq_func="EI",verbose=True, n_jobs=-1)
     print('*'*40)
     print('return -0.25*(val_accuracy+test_accuracy)/num_outer_split-0.25*(val_roc_auc+test_roc_auc)/num_outer_split')
@@ -701,7 +860,6 @@ batch_size=16, feature_batch=10, num_outer_split=5, frac_inner_val=0.25, max_len
         print('-'*40)
         print('(1d){}\n, (2d_0){}\n, (2d_1){}'.format(f_1d, f_2d_0, f_2d_1))
         ratio_1d, ratio_2d_1 = ratio_feature(f_1d, x_1d_feature), ratio_feature(f_2d_1, x_2d_feature_1)
-        # ratio_1d, ratio_2d_1 = len(f_1d)/len(x_1d_feature), len(f_2d_1)/len(x_2d_feature_1)
         x_1d_fs, x_2d_fs = fs_dataset(x_1d, x_2d, f_1d, f_2d_0, f_2d_1)
         #--- optimized model hyperparameters ---#
         model_params = {key: value for key, value in params.items() if not key.startswith('feature')}
@@ -711,8 +869,6 @@ batch_size=16, feature_batch=10, num_outer_split=5, frac_inner_val=0.25, max_len
         print('-'*40)
         for key, value in model_params.items():
             print(key, ":", value)
-
-
         test_accuracy, test_precision, test_recall, test_f1, test_roc_auc, test_pr_auc = 0, 0, 0, 0, 0, 0
         val_accuracy, val_precision, val_recall, val_f1, val_roc_auc,val_pr_auc = 0, 0, 0, 0, 0, 0
         KF = StratifiedKFold(num_outer_split, shuffle=True)
@@ -725,25 +881,30 @@ batch_size=16, feature_batch=10, num_outer_split=5, frac_inner_val=0.25, max_len
             train_index = train_index.flatten()
             dataset = FeatureSelectionDataset(x_1d_fs, x_2d_fs, y, max_len_2d)
             train_dataset = Subset(dataset, train_index)
-            train_loader = DataLoader(train_dataset, batch_size=batch_size)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4)
             val_dataset = Subset(dataset, val_index)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=4)
             test_dataset = Subset(dataset, test_index)
-            test_loader = DataLoader(test_dataset, batch_size=batch_size)
-            # _,tmp_2d,_ = next(iter(val_loader))
-            
+            test_loader = DataLoader(test_dataset, batch_size=batch_size, num_workers=4)
+
             #--- construct model with optimized hyperparameters ---#
+            torch.cuda.empty_cache()
+            gc.collect()
             len_2d_0, len_2d_1 = len_2d_feature(val_loader)
-            model_params.update({'len_1d':len(f_1d), 'len_2d':len_2d_0, 'dim_2d_input':len_2d_1})
-            # model_params.update({'len_1d':len(f_1d), 'len_2d':tmp_2d.shape[1], 'dim_2d_input':tmp_2d.shape[2]})
+            len_1d = 0 if f_1d is None else len(f_1d)
+            model_params.update({'len_1d':len_1d, 'len_2d':len_2d_0, 'dim_2d_input':len_2d_1})
             model = model_class(model_params)
             model.apply(init_weights)
             y_hat_val, y_true_val, y_hat_test, y_true_test = model.train_val(train_loader, val_loader, test_loader)
+            if torch.cuda.is_available():
+                model = model.cpu()
+                torch.cuda.empty_cache()
+            del train_dataset, train_loader, val_dataset, val_loader, test_dataset, test_loader, model
+            torch.cuda.empty_cache()
+            gc.collect()
            
             val_accuracy, val_precision, val_recall, val_f1, val_roc_auc, val_pr_auc = repeat_evaluate(val_accuracy, val_precision, val_recall, val_f1, val_roc_auc, val_pr_auc, y_hat_val, y_true_val, 'binary', flag_soft=True)
             test_accuracy, test_precision, test_recall, test_f1, test_roc_auc, test_pr_auc = repeat_evaluate(test_accuracy, test_precision, test_recall, test_f1, test_roc_auc, test_pr_auc, y_hat_test, y_true_test, 'binary', flag_soft=True)
-
-            # loss_all = loss_all + loss
             i = num_outer_split
         print('-'*40)
         print('Overall performance on validation set:')
@@ -879,18 +1040,13 @@ def union_attention(a, b):
     unique_gene = ~b.index.duplicated(keep='first')
     b = b.loc[unique_gene, unique_gene]
 
-    # 获得列名的并集
     union_features = list(set(a.columns).union(b.columns))
 
-    # 创建一个新的DataFrame，其索引和列为union_features，所有元素初始化为0
     union_attention_matrix = pd.DataFrame(0, index=union_features, columns=union_features)
 
-    # 将DataFrame a和b的值添加到union_attention
     for df in [a, b]:
-        # print(df)
         for i in df.columns:
             for j in df.columns:
-                # print(f"i: {i}, j: {j}")
                 union_attention_matrix.at[i, j] += df.at[i, j]
 
     return union_attention_matrix
@@ -921,6 +1077,7 @@ def obtain_stage_attention(x_stage, base_path):
     attn_head4 = union_attention_list(attn_head4)
     attn_matrix = attn_head1.add(attn_head4)
     return attn_matrix
+
 ###############################################
 #---------   Obtain top gene tools   ---------#
 ###############################################
